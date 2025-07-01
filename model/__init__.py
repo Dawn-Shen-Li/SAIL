@@ -72,7 +72,7 @@ def create_model(
             logit_bias=logit_bias, 
             width_factor=width_factor,
         )
-    model.to(device=device)
+       model.to(device=device)
     return model
 
 

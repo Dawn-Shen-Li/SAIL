@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../data/huggingface"
+		}
+	],
+	"settings": {
+		"python.defaultInterpreterPath": "/home/lshen/miniforge3/envs/sail/bin/python"
+	}
+}

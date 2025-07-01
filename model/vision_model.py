@@ -5,7 +5,7 @@ from PIL import Image, ImageFile
 import os
 from typing import List, Tuple, Dict, Any, Union, Optional
 from torchvision import transforms as pth_transforms
-from transformers import ImageProcessingMixin
+from transformers import ImageProcessingMixin, AutoConfig
 try:
     from transformers.image_processing_base import BaseBatchFeature
 except:
@@ -13,11 +13,10 @@ except:
 from packaging import version
 import transformers
 from .dinoforseg import Dinov2EncoderForSegmentation
-
+from accelerate import init_empty_weights, dispatch_model, infer_auto_device_map
 from .mae import get_mae_vit
 from .ibot import get_ibot_vit
 from .ijepa import get_ijepa_vit
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -63,10 +62,19 @@ class CustomImageProcessor(ImageProcessingMixin):
 class ImageEmbedding(nn.Module):
     def __init__(self, model_name="facebook/dinov2-base", device=None, seg: bool = False, agg_mode='concat'):
         super(ImageEmbedding, self).__init__()
-        self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')        
         self.seg = seg
         self.agg_mode = agg_mode
         self.model_name = model_name
+        
+        config = AutoConfig.from_pretrained(model_name)
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        device_map = infer_auto_device_map(
+            model, 
+            max_memory={i: "16GiB" for i in range(torch.cuda.device_count())}
+            #no_split_module_classes=["DinoVisionTransformerLayer"]
+            )
 
         if any(x in model_name for x in ['ibot', 'mae', 'dinov1', 'ml-aim', 'ijepa']):
             # load from local
@@ -93,29 +101,34 @@ class ImageEmbedding(nn.Module):
                     self.model.embed_dim = 1536
                 else:
                     raise ValueError(f"Invalid model name: {model_name}")
-            self.model = self.model.to(self.device).half()
+            if torch.cuda.device_count()>1:
+                print("Using DataParallel for custom models")
+                self.model = nn.DataParallel(self.model)
+                self.model = self.model.to(self.device).half()
+            else:
+                self.model = self.model.to(self.device).half()
             self.model.dtype = torch.float16
             self.image_processor = CustomImageProcessor()
         
         # load from huggingface
-        elif not seg and any(x in model_name.lower() for x in ['dinov2']) and version.parse(transformers.__version__) >= version.parse("4.46.0"):
+        elif not seg and any(x in model_name.lower() for x in ['dinov2']) and version.parse(transformers.__version__) >= version.parse("4.45.0"):
             # check if huggingface version is greater than 4.38.0
             print("Using model with SDPA")
             self.SDPA = True
-            self.model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa", torch_dtype=torch.float16)
+            self.model = AutoModel.from_pretrained(model_name, attn_implementation="sdpa", torch_dtype=torch.float16, device_map=device_map)
             self.image_processor = AutoImageProcessor.from_pretrained(model_name)
         elif any(x in model_name.lower() for x in ['clip']):
-            self.model = CLIPVisionModel.from_pretrained(model_name, torch_dtype=torch.float16)
+            self.model = CLIPVisionModel.from_pretrained(model_name, torch_dtype=torch.float16, device_map=device_map)
             self.image_processor = AutoImageProcessor.from_pretrained(model_name)
         elif any(x in model_name.lower() for x in ['aimv2']):
-            self.model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16, trust_remote_code=True)
+            self.model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16, trust_remote_code=True, device_map=device_map)
             self.image_processor = AutoImageProcessor.from_pretrained(model_name)
         else:
             if seg:
                 modify_vit('seg')
             self.SDPA = False
-            self.model = AutoModel.from_pretrained(model_name, attn_implementation="eager", torch_dtype=torch.float16)
-            self.image_processor = AutoImageProcessor.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name, attn_implementation="eager", torch_dtype=torch.float16, device_map=device_map)
+            self.image_processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
 
     def load_images_from_directory(self, images_path: List[str]) -> List[Image.Image]:
 
@@ -144,6 +157,29 @@ class ImageEmbedding(nn.Module):
             with torch.no_grad():
                 return self.forward(inputs)
 
+    def _get_model_device(self):
+        """Get the appropriate device for model inputs in multi-GPU setup"""
+        if torch.cuda.device_count()>1:
+            if hasattr(self.model, 'hf_device_map') and self.model.hf_device_map:
+                # Get the device of the embedding layer (usually the first layer)
+                device_map = self.model.hf_device_map
+                
+                # Look for embedding layer device
+                for layer_name, device in device_map.items():
+                    if 'embed' in layer_name.lower() or 'patch' in layer_name.lower():
+                        return torch.device(device)
+                
+                # Fallback to first device in map
+                return torch.device(next(iter(device_map.values())))
+            elif hasattr(self.model, 'module'):
+                # DataParallel case
+                return next(self.model.module.parameters()).device
+            else:
+                # Fallback to first parameter's device
+                return next(self.model.parameters()).device
+        else:
+            return torch.device(self.device)
+        
     def forward(self, inputs, patch_mode=False, attetion_type='qk', ignore_residual=False):
         """
         Get embeddings from the vision encoder.
@@ -153,10 +189,18 @@ class ImageEmbedding(nn.Module):
             patch_mode: if True, return all patch tokens.
             ignore_residual: if True, skip the residual connection in the last layer.
         """
+        input_device = self._get_model_device()
+        
         if self.seg:
             self.model.encoder.attetion_type = attetion_type
             self.model.encoder.ignore_residual = ignore_residual
-                
+        
+                # Move inputs to correct device
+        if isinstance(inputs, dict):
+            inputs = {k: v.to(input_device) for k, v in inputs.items()}
+        else:
+            inputs = inputs.to(input_device, non_blocking=True)
+                 
         if any(x in self.model_name.lower() for x in ['mae']):
             if isinstance(inputs, torch.Tensor):
                 outputs = self.model.forward_features(inputs)

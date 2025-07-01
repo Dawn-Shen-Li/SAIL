@@ -14,6 +14,7 @@ from torch.cuda.amp import autocast
 from functools import partial
 import numpy as np
 
+#torch.serialization.add_safe_globals([np.core.multiarray.scalar])
 
 class AlignmentLayer(nn.Module):
     def __init__(
@@ -207,8 +208,7 @@ class ShareLockAlignmentLayer(nn.Module):
             "logit_bias": self.get_logit_bias
         }
 
-
-        
+      
 
 class SAILModel(nn.Module):
     def __init__(
@@ -225,8 +225,8 @@ class SAILModel(nn.Module):
         sharelock: bool = False,
     ):
         super(SAILModel, self).__init__()
-        self.text_model = SentenceEmbedding(text_model_name)
         self.vision_model = ImageEmbedding(vision_model_name, seg=seg, agg_mode=agg_mode)
+        self.text_model = SentenceEmbedding(text_model_name)
         if any(x in vision_model_name for x in ['mae','ibot','dinov1','ml-aim','ijepa','clip','aimv2']) or 'patch' in agg_mode or 'cls' in agg_mode:
             if hasattr(self.vision_model.model, 'config'):
                 vision_dimesion = self.vision_model.model.config.hidden_size
@@ -245,6 +245,7 @@ class SAILModel(nn.Module):
         )  
         if vlhead_weights_path is not None:
             self.load_vlhead_weights(vlhead_weights_path)
+        self.vlhead.to(device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 
     def freeze_except_vlhead(self):
         self._freeze_parameters(self.vision_model)
@@ -260,7 +261,7 @@ class SAILModel(nn.Module):
             param.requires_grad = True
 
     def load_vlhead_weights(self, vlhead_weights_path):
-        weights = torch.load(vlhead_weights_path)
+        weights = torch.load(vlhead_weights_path,  weights_only=False)
         if "state_dict" in weights:
             weights = weights["state_dict"]
         msg = self.vlhead.load_state_dict(weights, strict=False)

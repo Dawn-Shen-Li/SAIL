@@ -49,11 +49,12 @@ class SentenceEmbedding(nn.Module):
         if not any(x in model_name for x in ['NV', 'clip']):
             self.pooling = POOL_CLASSES[get_embedding_strategy(model_name)]
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if 'clip' in model_name:
-            self.model = CLIPTextModel.from_pretrained(model_name, device_map=self.device).half()
+            self.model = CLIPTextModel.from_pretrained(model_name, device_map='auto').half()
         else:
-            self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True, device_map=self.device).half()
+            self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True, device_map='auto').half()
     
     def mean_pooling(self, model_output: torch.Tensor, attention_mask):
         token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
